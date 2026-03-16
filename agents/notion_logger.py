@@ -28,5 +28,5 @@ def log_to_notion(agent: str, task: str, input_text: str, result: str, success: 
             }
         }
         requests.post("https://api.notion.com/v1/pages", headers=NOTION_HEADERS, json=payload)
-    except:
-        pass  # Le log ne doit jamais faire crasher le bot
+    except Exception as e:
+        print(f"[notion_logger] ERROR: {e}")  # Ne crashe pas le bot mais trace l'erreur

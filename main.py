@@ -1,4 +1,5 @@
 import os
+import json
 import uuid
 import anthropic
 from collections import deque
@@ -14,15 +15,40 @@ from agents.content_strategy import run_content_strategy
 from agents.life_coach import run_life_coach
 from agents.security_monitor import run_security_monitor
 
-app = FastAPI(title="Hermès — 344 Agent Orchestrator", version="2.1.0")
+app = FastAPI(title="Hermès — 344 Agent Orchestrator", version="2.2.0")
 
 HERMES_API_KEY = os.environ.get("HERMES_API_KEY", "")
+STATE_FILE = os.environ.get("STATE_FILE", "/data/hermes_state.json")
 client = anthropic.Anthropic()
 
+
+# ─── State persistence ────────────────────────────────────────────────────────
+def _load_state() -> dict:
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_state():
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        with open(STATE_FILE, "w") as f:
+            json.dump({
+                "euclide": _euclide,
+                "task_results": _task_results,
+            }, f)
+    except Exception as e:
+        print(f"[hermes] state save error: {e}")
+
+
+_persisted = _load_state()
+
 # ─── Euclide Bridge state ─────────────────────────────────────────────────────
-_euclide = {"online": False, "registered_at": None, "callback_url": None}
+_euclide: dict = _persisted.get("euclide", {"online": False, "registered_at": None, "callback_url": None})
 _task_queue: deque = deque()
-_task_results: dict = {}
+_task_results: dict = _persisted.get("task_results", {})
 
 
 class DispatchRequest(BaseModel):
@@ -76,6 +102,10 @@ def _route(req: DispatchRequest) -> str:
         return run_life_coach(task or "checkin", ctx)
     elif intent == "security_monitor":
         return run_security_monitor(task or "full")
+    elif intent == "thales_query":
+        # thales_query est désormais géré directement par Archimède → Thalès API
+        # Hermès répond gracieusement pour éviter le 400
+        return "⚠️ thales_query déprécié — Archimède doit appeler Thalès directement via THALES_API_URL"
     else:
         raise HTTPException(status_code=400, detail=f"Unknown intent: {intent}")
 
@@ -115,6 +145,7 @@ async def euclide_register(req: EuclideRegisterRequest, x_api_key: str = Header(
     _euclide["online"] = True
     _euclide["registered_at"] = datetime.utcnow().isoformat()
     _euclide["callback_url"] = req.callback_url
+    _save_state()
     return {"status": "registered", "registered_at": _euclide["registered_at"]}
 
 
@@ -124,6 +155,7 @@ async def euclide_unregister(x_api_key: str = Header(...)):
     _euclide["online"] = False
     _euclide["registered_at"] = None
     _euclide["callback_url"] = None
+    _save_state()
     return {"status": "unregistered"}
 
 
@@ -146,6 +178,7 @@ async def euclide_ask(req: EuclideAskRequest, x_api_key: str = Header(...)):
     entry = {"task_id": task_id, "task": req.task, "context": req.context, "source": req.source}
     _task_queue.append(entry)
     _task_results[task_id] = {"status": "pending", "result": None}
+    _save_state()
     return {"status": "queued", "task_id": task_id}
 
 
@@ -165,6 +198,7 @@ async def euclide_respond(req: EuclideRespondRequest, x_api_key: str = Header(..
     if req.task_id not in _task_results:
         raise HTTPException(status_code=404, detail="Task not found")
     _task_results[req.task_id] = {"status": "done", "result": req.result}
+    _save_state()
     return {"status": "ok"}
 
 
