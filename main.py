@@ -1,5 +1,8 @@
 import os
+import uuid
 import anthropic
+from collections import deque
+from datetime import datetime
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 from typing import Optional
@@ -11,10 +14,15 @@ from agents.content_strategy import run_content_strategy
 from agents.life_coach import run_life_coach
 from agents.security_monitor import run_security_monitor
 
-app = FastAPI(title="Hermès — 344 Agent Orchestrator", version="2.0.0")
+app = FastAPI(title="Hermès — 344 Agent Orchestrator", version="2.1.0")
 
 HERMES_API_KEY = os.environ.get("HERMES_API_KEY", "")
 client = anthropic.Anthropic()
+
+# ─── Euclide Bridge state ─────────────────────────────────────────────────────
+_euclide = {"online": False, "registered_at": None, "callback_url": None}
+_task_queue: deque = deque()
+_task_results: dict = {}
 
 
 class DispatchRequest(BaseModel):
@@ -28,6 +36,22 @@ class DispatchResponse(BaseModel):
     result: str
     intent: str
     source: str
+
+
+# ─── Euclide Bridge models ─────────────────────────────────────────────────────
+class EuclideRegisterRequest(BaseModel):
+    callback_url: Optional[str] = "http://localhost:8766"
+
+
+class EuclideAskRequest(BaseModel):
+    task: str
+    context: Optional[str] = ""
+    source: Optional[str] = "unknown"
+
+
+class EuclideRespondRequest(BaseModel):
+    task_id: str
+    result: str
 
 
 def verify_key(x_api_key: str = Header(...)):
@@ -82,3 +106,72 @@ async def list_intents(x_api_key: str = Header(...)):
             "content_strategy", "life_coach", "security_monitor"
         ]
     }
+
+
+# ─── Euclide Bridge endpoints ─────────────────────────────────────────────────
+@app.post("/euclide/register")
+async def euclide_register(req: EuclideRegisterRequest, x_api_key: str = Header(...)):
+    verify_key(x_api_key)
+    _euclide["online"] = True
+    _euclide["registered_at"] = datetime.utcnow().isoformat()
+    _euclide["callback_url"] = req.callback_url
+    return {"status": "registered", "registered_at": _euclide["registered_at"]}
+
+
+@app.post("/euclide/unregister")
+async def euclide_unregister(x_api_key: str = Header(...)):
+    verify_key(x_api_key)
+    _euclide["online"] = False
+    _euclide["registered_at"] = None
+    _euclide["callback_url"] = None
+    return {"status": "unregistered"}
+
+
+@app.get("/euclide/status")
+async def euclide_status(x_api_key: str = Header(...)):
+    verify_key(x_api_key)
+    return {
+        "online": _euclide["online"],
+        "registered_at": _euclide["registered_at"],
+        "pending_tasks": len(_task_queue),
+    }
+
+
+@app.post("/euclide/ask")
+async def euclide_ask(req: EuclideAskRequest, x_api_key: str = Header(...)):
+    verify_key(x_api_key)
+    if not _euclide["online"]:
+        raise HTTPException(status_code=503, detail="Euclide offline")
+    task_id = str(uuid.uuid4())[:8]
+    entry = {"task_id": task_id, "task": req.task, "context": req.context, "source": req.source}
+    _task_queue.append(entry)
+    _task_results[task_id] = {"status": "pending", "result": None}
+    return {"status": "queued", "task_id": task_id}
+
+
+@app.get("/euclide/tasks")
+async def euclide_get_tasks(x_api_key: str = Header(...)):
+    verify_key(x_api_key)
+    if _task_queue:
+        task = _task_queue.popleft()
+        _task_results[task["task_id"]] = {"status": "in_progress", "result": None}
+        return {"task": task}
+    return {"task": None}
+
+
+@app.post("/euclide/respond")
+async def euclide_respond(req: EuclideRespondRequest, x_api_key: str = Header(...)):
+    verify_key(x_api_key)
+    if req.task_id not in _task_results:
+        raise HTTPException(status_code=404, detail="Task not found")
+    _task_results[req.task_id] = {"status": "done", "result": req.result}
+    return {"status": "ok"}
+
+
+@app.get("/euclide/result/{task_id}")
+async def euclide_result(task_id: str, x_api_key: str = Header(...)):
+    verify_key(x_api_key)
+    result = _task_results.get(task_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return result
