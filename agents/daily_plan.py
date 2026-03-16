@@ -6,7 +6,7 @@ import email
 from email.header import decode_header
 import json
 
-NOTION_TOKEN = os.environ["NOTION_TOKEN"]
+NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "")
 NOTION_PAGE_ID = "322563ef9d0281479c6aef4984219ca7"
 STATS_PAGE_ID = "324563ef9d0281c89ec9dcb673f48f85"
 GMAIL_ADDRESS = os.environ.get("GMAIL_ADDRESS", "")
