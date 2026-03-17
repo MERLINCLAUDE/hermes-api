@@ -5,6 +5,7 @@ import imaplib
 import email
 from email.header import decode_header
 import json
+from agents.weather import get_weather
 
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "")
 NOTION_PAGE_ID = "322563ef9d0281479c6aef4984219ca7"
@@ -79,6 +80,7 @@ def fetch_emails():
 
 def run_daily_plan(client, imessage_context=""):
     """Génère le plan du jour et le publie sur Notion. Retourne l'URL de la page."""
+    weather = get_weather()
     emails = fetch_emails()
     email_context = ""
     if emails:
@@ -92,6 +94,9 @@ def run_daily_plan(client, imessage_context=""):
             email_context = result
 
     context_block = ""
+    context_block += f"\nMétéo aujourd'hui (Egly) :\n{weather['summary']}"
+    if weather.get("outdoor_ok") is False:
+        context_block += "\n⚠️ Conditions extérieures défavorables — adapter les tournages en extérieur."
     if email_context:
         context_block += f"\nEmails avec action :\n{email_context}"
     if imessage_context:
@@ -139,6 +144,9 @@ Sans ** ou *. Concis et actionnable."""
     children = [{
         "object": "block", "type": "callout",
         "callout": {"rich_text": rt(f"Généré via Archimède · {today}"), "icon": {"type": "emoji", "emoji": "⚡"}, "color": "gray_background"}
+    }, {
+        "object": "block", "type": "callout",
+        "callout": {"rich_text": rt(weather["summary"]), "icon": {"type": "emoji", "emoji": weather["emoji"]}, "color": "blue_background"}
     }, {"object": "block", "type": "divider", "divider": {}}]
 
     for line in plan_text.split("\n"):
