@@ -38,6 +38,7 @@ def _save_state():
             json.dump({
                 "euclide": _euclide,
                 "task_results": _task_results,
+                "conversation_history": _conversation_history[-100:],
             }, f)
     except Exception as e:
         print(f"[hermes] state save error: {e}")
@@ -49,6 +50,7 @@ _persisted = _load_state()
 _euclide: dict = _persisted.get("euclide", {"online": False, "registered_at": None, "callback_url": None})
 _task_queue: deque = deque()
 _task_results: dict = _persisted.get("task_results", {})
+_conversation_history: list = _persisted.get("conversation_history", [])  # max 100 entrées
 
 # ─── Shared context (mémoire partagée inter-agents) ───────────────────────────
 _shared_context: dict = {}  # {"key": {"value": ..., "updated_at": ..., "source": ...}}
@@ -187,6 +189,16 @@ async def euclide_ask(req: EuclideAskRequest, x_api_key: str = Header(...)):
     entry = {"task_id": task_id, "task": req.task, "context": req.context, "source": req.source}
     _task_queue.append(entry)
     _task_results[task_id] = {"status": "pending", "result": None}
+    _conversation_history.append({
+        "task_id": task_id,
+        "from": req.source,
+        "to": "euclide",
+        "task": req.task,
+        "context": req.context,
+        "submitted_at": datetime.utcnow().isoformat(),
+        "response": None,
+        "responded_at": None,
+    })
     _save_state()
     return {"status": "queued", "task_id": task_id}
 
@@ -207,8 +219,19 @@ async def euclide_respond(req: EuclideRespondRequest, x_api_key: str = Header(..
     if req.task_id not in _task_results:
         raise HTTPException(status_code=404, detail="Task not found")
     _task_results[req.task_id] = {"status": "done", "result": req.result}
+    for entry in reversed(_conversation_history):
+        if entry["task_id"] == req.task_id:
+            entry["response"] = req.result
+            entry["responded_at"] = datetime.utcnow().isoformat()
+            break
     _save_state()
     return {"status": "ok"}
+
+
+@app.get("/euclide/history")
+async def euclide_history(x_api_key: str = Header(...), limit: int = 20):
+    verify_key(x_api_key)
+    return {"history": list(reversed(_conversation_history))[:limit], "total": len(_conversation_history)}
 
 
 @app.get("/euclide/result/{task_id}")
