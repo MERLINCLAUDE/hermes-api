@@ -50,6 +50,15 @@ _euclide: dict = _persisted.get("euclide", {"online": False, "registered_at": No
 _task_queue: deque = deque()
 _task_results: dict = _persisted.get("task_results", {})
 
+# ─── Shared context (mémoire partagée inter-agents) ───────────────────────────
+_shared_context: dict = {}  # {"key": {"value": ..., "updated_at": ..., "source": ...}}
+
+
+class ContextSetRequest(BaseModel):
+    key: str
+    value: str
+    source: Optional[str] = "unknown"
+
 
 class DispatchRequest(BaseModel):
     intent: str
@@ -209,3 +218,34 @@ async def euclide_result(task_id: str, x_api_key: str = Header(...)):
     if not result:
         raise HTTPException(status_code=404, detail="Task not found")
     return result
+
+
+# ─── Shared context endpoints ─────────────────────────────────────────────────
+@app.post("/context/set")
+async def context_set(req: ContextSetRequest, x_api_key: str = Header(...)):
+    verify_key(x_api_key)
+    _shared_context[req.key] = {
+        "value": req.value,
+        "updated_at": datetime.utcnow().isoformat(),
+        "source": req.source,
+    }
+    return {"status": "ok", "key": req.key}
+
+
+@app.get("/context/get")
+async def context_get(x_api_key: str = Header(...), key: Optional[str] = None):
+    verify_key(x_api_key)
+    if key:
+        entry = _shared_context.get(key)
+        return {key: entry} if entry else {}
+    return _shared_context
+
+
+@app.delete("/context/clear")
+async def context_clear(x_api_key: str = Header(...), key: Optional[str] = None):
+    verify_key(x_api_key)
+    if key:
+        _shared_context.pop(key, None)
+    else:
+        _shared_context.clear()
+    return {"status": "cleared"}
