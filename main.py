@@ -52,6 +52,9 @@ _task_queue: deque = deque()
 _task_results: dict = _persisted.get("task_results", {})
 _conversation_history: list = _persisted.get("conversation_history", [])  # max 100 entrées
 
+# ─── Messages Euclide → Archimède (push asynchrone) ──────────────────────────
+_euclide_push_queue: deque = deque(maxlen=50)  # messages non lus par Archimède
+
 # ─── Shared context (mémoire partagée inter-agents) ───────────────────────────
 _shared_context: dict = {}  # {"key": {"value": ..., "updated_at": ..., "source": ...}}
 
@@ -89,6 +92,11 @@ class EuclideAskRequest(BaseModel):
 class EuclideRespondRequest(BaseModel):
     task_id: str
     result: str
+
+
+class EuclidePushRequest(BaseModel):
+    message: str
+    category: Optional[str] = "info"  # info | alerte | deploy | question
 
 
 def verify_key(x_api_key: str = Header(...)):
@@ -241,6 +249,30 @@ async def euclide_result(task_id: str, x_api_key: str = Header(...)):
     if not result:
         raise HTTPException(status_code=404, detail="Task not found")
     return result
+
+
+# ─── Euclide → Archimède push ─────────────────────────────────────────────────
+@app.post("/euclide/push")
+async def euclide_push(req: EuclidePushRequest, x_api_key: str = Header(...)):
+    """Euclide pousse un message vers Archimède (sera lu au prochain message de Lucas)."""
+    verify_key(x_api_key)
+    _euclide_push_queue.append({
+        "message": req.message,
+        "category": req.category,
+        "pushed_at": datetime.utcnow().isoformat(),
+        "read": False,
+    })
+    return {"status": "queued", "pending": len(_euclide_push_queue)}
+
+
+@app.get("/euclide/messages")
+async def euclide_messages(x_api_key: str = Header(...)):
+    """Archimède récupère et vide les messages en attente d'Euclide."""
+    verify_key(x_api_key)
+    unread = [m for m in _euclide_push_queue if not m["read"]]
+    for m in _euclide_push_queue:
+        m["read"] = True
+    return {"messages": unread, "count": len(unread)}
 
 
 # ─── Shared context endpoints ─────────────────────────────────────────────────
