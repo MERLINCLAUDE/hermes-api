@@ -1,8 +1,10 @@
 import os
 import json
 import uuid
+import asyncio
 import anthropic
 from collections import deque
+from contextlib import asynccontextmanager
 from datetime import datetime
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
@@ -15,7 +17,62 @@ from agents.content_strategy import run_content_strategy
 from agents.life_coach import run_life_coach
 from agents.security_monitor import run_security_monitor
 
-app = FastAPI(title="Hermès — 344 Agent Orchestrator", version="3.0.0")
+async def _scheduler_loop():
+    """Boucle de scheduling — vérifie les triggers time-based toutes les 60s."""
+    def _cron_matches(cron_expr: str, now: datetime) -> bool:
+        """Vérifie si une expression cron correspond au moment actuel (minute précise)."""
+        try:
+            parts = cron_expr.strip().split()
+            if len(parts) != 5:
+                return False
+            minute, hour, day, month, weekday = parts
+            def _match(field, value):
+                if field == "*":
+                    return True
+                if "," in field:
+                    return str(value) in field.split(",")
+                if "-" in field:
+                    a, b = field.split("-")
+                    return int(a) <= value <= int(b)
+                if "/" in field:
+                    _, step = field.split("/")
+                    return value % int(step) == 0
+                return str(value) == field
+            return (
+                _match(minute, now.minute) and
+                _match(hour, now.hour) and
+                _match(day, now.day) and
+                _match(month, now.month) and
+                _match(weekday, now.weekday())
+            )
+        except Exception:
+            return False
+
+    while True:
+        await asyncio.sleep(60)
+        try:
+            now = datetime.utcnow()
+            triggers = sb_get_active_triggers("time")
+            for t in triggers:
+                if t.get("cron") and _cron_matches(t["cron"], now):
+                    print(f"[scheduler] Firing trigger: {t['name']}")
+                    task_id = sb_enqueue_task(
+                        t["from_agent"], t["to_agent"],
+                        t["task"], t.get("context", "")
+                    )
+                    sb_fire_trigger(t["trigger_id"])
+                    print(f"[scheduler] {t['name']} → task_id={task_id}")
+        except Exception as e:
+            print(f"[scheduler] error: {e}")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    asyncio.create_task(_scheduler_loop())
+    print("[hermes] Scheduler démarré ✅")
+    yield
+
+app = FastAPI(title="Hermès — 344 Agent Orchestrator", version="3.0.0", lifespan=lifespan)
 
 HERMES_API_KEY = os.environ.get("HERMES_API_KEY", "")
 STATE_FILE = os.environ.get("STATE_FILE", "/data/hermes_state.json")
@@ -145,6 +202,35 @@ def sb_get_next_task(agent_name: str) -> dict | None:
     return None
 
 
+async def _check_event_triggers(task_id: str):
+    """Vérifie et fire les triggers event-based après complétion d'une tâche."""
+    if not _sb:
+        return
+    try:
+        rows = _sb.table("agent_tasks").select("*").eq("task_id", task_id).execute().data
+        if not rows:
+            return
+        task = rows[0]
+        agent = task.get("from_agent", "")
+        task_name = task.get("task", "")
+
+        event_triggers = sb_get_active_triggers("event")
+        for t in event_triggers:
+            if t.get("event_agent") and t["event_agent"] != agent:
+                continue
+            keyword = t.get("event_keyword")
+            if keyword and keyword.lower() not in task_name.lower():
+                continue
+            print(f"[scheduler] Event trigger fired: {t['name']}")
+            new_task_id = sb_enqueue_task(
+                t["from_agent"], t["to_agent"],
+                t["task"], t.get("context", "")
+            )
+            sb_fire_trigger(t["trigger_id"])
+    except Exception as e:
+        print(f"[scheduler] event trigger error: {e}")
+
+
 def sb_complete_task(task_id: str, result: str) -> bool:
     if _sb:
         try:
@@ -153,6 +239,8 @@ def sb_complete_task(task_id: str, result: str) -> bool:
                 "result": result,
                 "updated_at": datetime.utcnow().isoformat(),
             }).eq("task_id", task_id).execute()
+            # Check event triggers
+            asyncio.create_task(_check_event_triggers(task_id))
             return True
         except Exception as e:
             print(f"[sb] complete_task error: {e}")
@@ -213,6 +301,35 @@ def sb_delete_context(key: str | None = None) -> bool:
     else:
         _shared_context.clear()
     return True
+
+
+def sb_get_active_triggers(trigger_type: str | None = None) -> list:
+    """Récupère les triggers actifs depuis Supabase."""
+    if not _sb:
+        return []
+    try:
+        q = _sb.table("triggers").select("*").eq("active", True)
+        if trigger_type:
+            q = q.eq("type", trigger_type)
+        return q.execute().data or []
+    except Exception as e:
+        print(f"[sb] get_triggers error: {e}")
+        return []
+
+
+def sb_fire_trigger(trigger_id: str):
+    """Met à jour last_fired et fire_count après exécution."""
+    if not _sb:
+        return
+    try:
+        rows = _sb.table("triggers").select("fire_count").eq("trigger_id", trigger_id).execute().data
+        count = rows[0]["fire_count"] if rows else 0
+        _sb.table("triggers").update({
+            "last_fired": datetime.utcnow().isoformat(),
+            "fire_count": count + 1,
+        }).eq("trigger_id", trigger_id).execute()
+    except Exception as e:
+        print(f"[sb] fire_trigger error: {e}")
 
 
 # ─── State persistence (fallback in-memory) ──────────────────────────────────
@@ -307,6 +424,18 @@ class AgentRespondRequest(BaseModel):
     task_id: str
     result: str
     agent_name: str
+
+
+class TriggerCreateRequest(BaseModel):
+    name: str
+    type: str                    # "time" | "event"
+    cron: Optional[str] = None   # for time triggers, e.g. "0 18 * * *"
+    event_agent: Optional[str] = None    # for event triggers
+    event_keyword: Optional[str] = None  # optional keyword match
+    from_agent: str = "archimede"
+    to_agent: str
+    task: str
+    context: Optional[str] = ""
 
 
 # ─── Auth ─────────────────────────────────────────────────────────────────────
@@ -588,3 +717,48 @@ async def context_clear(x_api_key: str = Header(...), key: Optional[str] = None)
     verify_key(x_api_key)
     sb_delete_context(key)
     return {"status": "cleared"}
+
+
+# ─── Triggers ────────────────────────────────────────────────────────────────
+@app.post("/triggers")
+async def create_trigger(req: TriggerCreateRequest, x_api_key: str = Header(...)):
+    """Crée un trigger time-based ou event-based."""
+    verify_key(x_api_key)
+    if not _sb:
+        raise HTTPException(503, "Supabase requis pour les triggers")
+    data = req.model_dump()
+    data["trigger_id"] = str(uuid.uuid4())[:12]
+    _sb.table("triggers").insert(data).execute()
+    return {"status": "created", "trigger_id": data["trigger_id"], "name": req.name}
+
+
+@app.get("/triggers")
+async def list_triggers(x_api_key: str = Header(...)):
+    """Liste tous les triggers."""
+    verify_key(x_api_key)
+    triggers = sb_get_active_triggers()
+    return {"triggers": triggers, "count": len(triggers)}
+
+
+@app.delete("/triggers/{trigger_id}")
+async def delete_trigger(trigger_id: str, x_api_key: str = Header(...)):
+    """Désactive un trigger."""
+    verify_key(x_api_key)
+    if _sb:
+        _sb.table("triggers").update({"active": False}).eq("trigger_id", trigger_id).execute()
+    return {"status": "disabled", "trigger_id": trigger_id}
+
+
+@app.post("/triggers/fire/{trigger_id}")
+async def fire_trigger_now(trigger_id: str, x_api_key: str = Header(...)):
+    """Force l'exécution immédiate d'un trigger (debug/test)."""
+    verify_key(x_api_key)
+    if not _sb:
+        raise HTTPException(503, "Supabase requis")
+    rows = _sb.table("triggers").select("*").eq("trigger_id", trigger_id).execute().data
+    if not rows:
+        raise HTTPException(404, "Trigger not found")
+    t = rows[0]
+    task_id = sb_enqueue_task(t["from_agent"], t["to_agent"], t["task"], t.get("context", ""))
+    sb_fire_trigger(trigger_id)
+    return {"status": "fired", "task_id": task_id, "trigger": t["name"]}
