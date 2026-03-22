@@ -518,13 +518,41 @@ async def agent_unregister(name: str, x_api_key: str = Header(...)):
     return {"status": "offline", "agent": name}
 
 
+@app.post("/agents/heartbeat")
+async def agent_heartbeat(name: str, x_api_key: str = Header(...)):
+    """Agent signale qu'il est vivant. Met à jour last_seen dans Supabase."""
+    verify_key(x_api_key)
+    if _sb:
+        try:
+            _sb.table("agents").update({
+                "status": "online",
+                "last_seen": datetime.utcnow().isoformat(),
+            }).eq("name", name).execute()
+        except Exception as e:
+            print(f"[heartbeat] {name} error: {e}")
+    return {"status": "ok", "agent": name, "ts": datetime.utcnow().isoformat()}
+
+
 @app.get("/agents")
 async def list_agents(x_api_key: str = Header(...)):
     verify_key(x_api_key)
     agents = sb_get_agents()
     if not agents:
-        # Fallback: retourner l'état Euclide connu
         agents = [{"name": "euclide", "status": "online" if _euclide["online"] else "offline"}]
+        return {"agents": agents, "count": len(agents)}
+
+    # Auto-mark stale agents as offline (last_seen > 90s ago)
+    now = datetime.utcnow()
+    for a in agents:
+        last_seen_str = a.get("last_seen")
+        if last_seen_str and a.get("status") == "online":
+            try:
+                last_seen = datetime.fromisoformat(last_seen_str.replace("Z", "+00:00")).replace(tzinfo=None)
+                if (now - last_seen).total_seconds() > 90:
+                    a["status"] = "stale"
+            except Exception:
+                pass
+
     return {"agents": agents, "count": len(agents)}
 
 
