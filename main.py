@@ -5,7 +5,7 @@ import asyncio
 import anthropic
 from collections import deque
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 from typing import Optional, List
@@ -65,6 +65,28 @@ async def _scheduler_loop():
         except Exception as e:
             print(f"[scheduler] error: {e}")
 
+        # Auto-fail tasks pending > 30 minutes
+        try:
+            if _sb:
+                cutoff = (datetime.utcnow() - timedelta(minutes=30)).isoformat()
+                stale = (
+                    _sb.table("agent_tasks")
+                    .select("task_id,to_agent,task")
+                    .eq("status", "pending")
+                    .lt("created_at", cutoff)
+                    .execute()
+                    .data or []
+                )
+                for t in stale:
+                    _sb.table("agent_tasks").update({
+                        "status": "failed",
+                        "result": "TIMEOUT: task pending > 30 minutes",
+                        "updated_at": datetime.utcnow().isoformat(),
+                    }).eq("task_id", t["task_id"]).execute()
+                    print(f"[scheduler] Task {t['task_id']} timed out (to: {t['to_agent']})")
+        except Exception as e:
+            print(f"[scheduler] timeout cleanup error: {e}")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -72,7 +94,7 @@ async def lifespan(app: FastAPI):
     print("[hermes] Scheduler démarré ✅")
     yield
 
-app = FastAPI(title="Hermès — 344 Agent Orchestrator", version="3.0.0", lifespan=lifespan)
+app = FastAPI(title="Hermès — 344 Agent Orchestrator", version="3.1.0", lifespan=lifespan)
 
 HERMES_API_KEY = os.environ.get("HERMES_API_KEY", "")
 STATE_FILE = os.environ.get("STATE_FILE", "/data/hermes_state.json")
@@ -473,9 +495,95 @@ async def health():
     return {
         "status": "ok",
         "service": "hermes",
-        "version": "3.0.0",
+        "version": "3.1.0",
         "supabase": _sb is not None,
     }
+
+
+@app.get("/status")
+async def system_status():
+    """Dashboard JSON public — pas d'auth requis pour monitoring mobile."""
+    agents = sb_get_agents() or []
+    now = datetime.utcnow()
+
+    agent_statuses = []
+    for a in agents:
+        last_seen_str = a.get("last_seen")
+        seconds_ago = None
+        status = a.get("status", "unknown")
+        if last_seen_str:
+            try:
+                ls = datetime.fromisoformat(
+                    last_seen_str.replace("Z", "+00:00")
+                ).replace(tzinfo=None)
+                seconds_ago = int((now - ls).total_seconds())
+                if seconds_ago > 90:
+                    status = "stale"
+            except Exception:
+                pass
+        agent_statuses.append({
+            "name": a.get("name"),
+            "status": status,
+            "last_seen_seconds_ago": seconds_ago,
+            "capabilities": a.get("capabilities", []),
+        })
+
+    pending_tasks = 0
+    recent_errors = 0
+    if _sb:
+        try:
+            pending = (
+                _sb.table("agent_tasks")
+                .select("task_id", count="exact")
+                .eq("status", "pending")
+                .execute()
+            )
+            pending_tasks = pending.count or 0
+            yesterday = (now - timedelta(hours=24)).isoformat()
+            errors = (
+                _sb.table("agent_tasks")
+                .select("task_id", count="exact")
+                .eq("status", "failed")
+                .gte("updated_at", yesterday)
+                .execute()
+            )
+            recent_errors = errors.count or 0
+        except Exception:
+            pass
+
+    return {
+        "service": "hermes",
+        "version": "3.1.0",
+        "timestamp": now.isoformat(),
+        "supabase_connected": _sb is not None,
+        "agents": agent_statuses,
+        "tasks": {
+            "pending": pending_tasks,
+            "errors_24h": recent_errors,
+        },
+        "uptime_check": "ok",
+    }
+
+
+@app.get("/tasks/recent")
+async def recent_tasks(
+    x_api_key: str = Header(...),
+    limit: int = 20,
+    status: Optional[str] = None,
+):
+    """Liste les tâches récentes — debug et observabilité."""
+    verify_key(x_api_key)
+    if _sb:
+        query = (
+            _sb.table("agent_tasks")
+            .select("*")
+            .order("created_at", desc=True)
+            .limit(limit)
+        )
+        if status:
+            query = query.eq("status", status)
+        return {"tasks": query.execute().data or []}
+    return {"tasks": [], "note": "supabase offline"}
 
 
 @app.post("/dispatch", response_model=DispatchResponse)
